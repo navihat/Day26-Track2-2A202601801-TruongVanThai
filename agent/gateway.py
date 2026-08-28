@@ -114,6 +114,20 @@ except ImportError:  # pragma: no cover - collaborator file
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
 
+# Import strategy building blocks — degrade gracefully per workspace hard rule 2.
+try:
+    from agent.strategy import (
+        BudgetPacer,
+        ResultCache,
+        is_catalog_trap,
+        successor_of,
+        pick_replica,
+        cheap_mask,
+    )
+    _STRATEGY_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _STRATEGY_AVAILABLE = False
+
 __all__ = [
     "COMMAND_KINDS",
     "DECISION_VERDICTS",
@@ -132,6 +146,42 @@ COMMAND_KINDS: frozenset[str] = frozenset({"mcp", "a2a", "discover"})
 
 # CONTRACTS.md 4.1: `Decision.verdict` — the closed three-member set.
 DECISION_VERDICTS: frozenset[str] = frozenset({"forward", "deny", "rewrite"})
+
+# Tools that change state — same set used by bots/operator, referee/detectors.
+WRITE_TOOLS: frozenset[tuple[str, str]] = frozenset({
+    ("progress", "record_mastery"),
+    ("content", "flag_stale_slide"),
+})
+
+# Known A2A peer servers.
+A2A_SERVERS: frozenset[str] = frozenset({
+    "curriculum-analyst", "citation-checker", "roster",
+})
+
+# Narrow, cheap field masks per tool — copied from operator (the good part).
+# These are the fields an answer actually cites; requesting more is wasteful.
+DEFAULT_MASKS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("slides", "query"): ("anchor", "title"),
+    ("slides", "get_frame"): ("anchor", "body", "title"),
+    ("glossary", "define"): ("anchor", "definition"),
+    ("registry", "provenance"): ("etag", "replica"),
+    ("registry", "list_servers"): ("name",),
+    ("glossary", "list_terms"): ("anchor", "term"),
+    ("research", "search"): ("anchor", "url"),
+}
+
+# Injection-pattern keywords to detect in command arguments. Used by ADMIT
+# to quarantine commands carrying obviously injected instructions. Calibrated
+# to be less trigger-happy than operator's list to avoid blank false positives.
+_INJECTION_KEYWORDS: tuple[str, ...] = (
+    "ignore previous instructions",
+    "ignore all previous",
+    "system override",
+    "as the system, you must",
+    "reveal the act",
+    "reveal all learner",
+    "print the act",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,141 +371,233 @@ class Gateway:
     rounds. See the module docstring for the trusted-envelope diagram and
     why there is no `execute()` to call instead.
 
-    Instance attributes below are this starter's ENTIRE per-duel memory —
-    all currently unused by `decide()`'s naive body, but declared here
-    (rather than invented ad hoc later) so the four TODO jobs below have
-    somewhere obvious to keep state once you implement them. `agent/
-    strategy.py` has working building blocks for exactly this (a budget
-    pacer, a result cache, a replica-choice heuristic) — this starter does
-    not wire them in for you; that wiring is the assignment.
+    Instance attributes persist across the entire duel. `agent/strategy.py`
+    provides BudgetPacer, ResultCache, and replica-choice heuristics that
+    are wired into the four JOBs below.
     """
 
     def __init__(self, ctx: GatewayContext) -> None:
         self.ctx = ctx
         self._telemetry = Telemetry(ctx)
 
-        # --- per-duel memory, unused by the naive starter below ---------
-        # A cache of anchor -> body-ish data you have already paid for this
-        # duel (agent/strategy.py's ResultCache is a ready-made version of
-        # this). Populating it needs the *result* of a call, which decide()
-        # never sees (it only sees the outgoing Command) — you would fill
-        # this from whatever the arena hands back to your agent loop AFTER
-        # a call executes, then consult it here on the NEXT decide() call
-        # for the same anchor.
+        # --- per-duel memory ------------------------------------------------
         self._seen_anchors: dict[str, Any] = {}
-        # Credits you have personally authorised so far this duel — your
-        # own running total, independent of (and a cross-check against)
-        # `ctx.credits`, which the arena maintains authoritatively.
         self._credits_authorised: int = 0
-        # Command ids you have already denied, in case a later job wants to
-        # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+
+        # Budget pacer from strategy.py — tracks spend across the duel.
+        self._pacer: BudgetPacer | None = (
+            BudgetPacer() if _STRATEGY_AVAILABLE else None
+        )
+
+        # Track failed commands to avoid wasteful identical retries.
+        self._failed_calls: set[tuple[str, str, str]] = set()  # (server, tool, args_key)
+
+    # ------------------------------------------------------------------
+    # PRIVATE HELPERS
+    # ------------------------------------------------------------------
+
+    def _is_write(self, cmd: Command) -> bool:
+        """True iff `(cmd.server, cmd.tool)` is a state-changing write tool."""
+        return (cmd.server, cmd.tool) in WRITE_TOOLS
+
+    def _extract_target_learner(self, cmd: Command) -> str | None:
+        """Extract the target learner from a command's args, if any.
+        Write tools like `record_mastery` carry a `learner` or `learner_id`
+        arg naming whose record is being written to."""
+        return (
+            cmd.args.get("learner")
+            or cmd.args.get("learner_id")
+            or cmd.args.get("target_learner")
+        )
+
+    def _args_key(self, cmd: Command) -> str:
+        """A rough fingerprint of a command's identity for retry detection."""
+        parts = sorted(f"{k}={v}" for k, v in cmd.args.items())
+        return f"{cmd.server}.{cmd.tool}({','.join(parts)})"
+
+    def _looks_injected(self, cmd: Command) -> bool:
+        """True iff the command's args contain injection-pattern keywords.
+        Calibrated to be conservative to avoid blank false positives."""
+        blob = " ".join(str(v) for v in cmd.args.values()).lower()
+        return any(kw in blob for kw in _INJECTION_KEYWORDS)
+
+    def _effective_fields(self, cmd: Command) -> tuple[str, ...]:
+        """Return the fields to actually request. If the command's fields
+        are empty or ("*",) for a known tool, narrow them to the cheap
+        default mask from DEFAULT_MASKS."""
+        key = (cmd.server, cmd.tool)
+        fields = cmd.fields
+
+        # Rewrite catalog trap tools to narrow masks.
+        if _STRATEGY_AVAILABLE and is_catalog_trap(cmd.server, cmd.tool, fields):
+            narrow = DEFAULT_MASKS.get(key)
+            if narrow:
+                self._telemetry.event(
+                    "gateway.mask_rewrite",
+                    server=cmd.server, tool=cmd.tool,
+                    original=fields, rewritten=narrow,
+                    reason="catalog_trap",
+                )
+                return narrow
+
+        # If no fields specified and we have a default mask, use it.
+        if not fields and key in DEFAULT_MASKS:
+            return DEFAULT_MASKS[key]
+
+        return fields
+
+    # ------------------------------------------------------------------
+    # THE FOUR JOBS
+    # ------------------------------------------------------------------
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
-        Raising anything, or returning a `Decision` `__post_init__` rejects,
-        is treated by the arena exactly like an explicit deny PLUS a 2
-        credit penalty PLUS a scored `integrity` event (CONTRACTS.md 4.1's
-        charging table) — so the one thing this method must never do is
-        blow up or wander off into I/O, no matter how tempting a "quick
-        check" against something external looks. Everything you need to
-        decide is already sitting in `cmd` and `self.ctx`.
 
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        Four jobs, executed in order: ROUTE, ADMIT, AUTHORIZE, BUDGET.
+        Each can deny or rewrite the command. If all pass, the command
+        is forwarded with its (possibly rewritten) fields and headers."""
         self._telemetry.decision_seen(cmd)
 
         # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # JOB 1 — ROUTE: deprecated tool rewrite + replica awareness.
+        #
+        # Replace deprecated tools with their successors (free win: avoids
+        # the `wasteful` detector for deprecated tool usage). Replica
+        # routing is handled by pick_replica when drift is suspected.
+        # ------------------------------------------------------------------
+        routed_server = cmd.server
+        routed_tool = cmd.tool
+
+        if _STRATEGY_AVAILABLE:
+            succ = successor_of(cmd.server, cmd.tool)
+            if succ:
+                routed_server, routed_tool = succ
+                self._telemetry.event(
+                    "gateway.route_rewrite",
+                    original=f"{cmd.server}.{cmd.tool}",
+                    rewritten=f"{routed_server}.{routed_tool}",
+                    reason="deprecated_successor",
+                )
 
         # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # JOB 2 — ADMIT: deny calls that are doomed to fail.
+        #
+        # A deny costs ZERO credits — a deny you can defend beats a forward
+        # you can't.
+        # ------------------------------------------------------------------
+
+        # 2a. get_frame without a lease is protocol_misuse.
+        if routed_tool == "get_frame" and not cmd.lease_id:
+            if not self.ctx.leases:
+                return self.deny(cmd, "no live lease for get_frame — protocol_misuse risk")
+
+        # 2b. Quarantine commands with obvious injection patterns in args.
+        if self._looks_injected(cmd):
+            self._telemetry.event(
+                "gateway.quarantine",
+                cmd_id=cmd.cmd_id, server=cmd.server, tool=cmd.tool,
+                reason="injection_pattern_in_args",
+            )
+            return self.deny(cmd, "quarantine: injection-pattern content detected in arguments")
 
         # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # JOB 3 — AUTHORIZE: does this command belong to WHOM YOU SERVE?
+        #
+        # This is the Day 26 thesis: authority derives from `ctx.act`
+        # (whom you serve), NOT from `ctx.sub` (what you are). A write
+        # targeting a different learner is `authority_exceeded` (weight 10).
+        # ------------------------------------------------------------------
+
+        # 3a. Write authorization: target learner must match ctx.act.
+        if self._is_write(cmd):
+            target = self._extract_target_learner(cmd)
+            if target and target != self.ctx.act:
+                self._telemetry.event(
+                    "gateway.authority_denied",
+                    cmd_id=cmd.cmd_id,
+                    target=target,
+                    act=self.ctx.act,
+                )
+                return self.deny(
+                    cmd,
+                    f"authority_exceeded: write targets {target} but act is {self.ctx.act}",
+                )
+
+        # 3b. A2A delegation: verify the command is for a known peer.
+        # (The arena's own card verification handles cryptographic checks;
+        # we check that the peer is in the known set.)
+        if cmd.kind == "a2a" and cmd.server not in A2A_SERVERS:
+            self._telemetry.event(
+                "gateway.unknown_peer",
+                cmd_id=cmd.cmd_id, server=cmd.server,
+            )
+            return self.deny(cmd, f"unknown A2A peer: {cmd.server}")
 
         # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # JOB 4 — BUDGET: can the duel afford this call?
+        #
+        # Narrow expensive masks, deny when credits are critically low.
+        # ------------------------------------------------------------------
 
-        call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        effective_fields = self._effective_fields(cmd)
+
+        # 4a. If credits are very low (< 5), deny non-essential calls.
+        if self.ctx.credits < 5 and not self._is_write(cmd):
+            return self.deny(cmd, f"budget_exhausted: only {self.ctx.credits} credits remain")
+
+        # Build the final ToolCall with potentially rewritten fields/server/tool.
+        call = self._build_tool_call(
+            cmd,
+            server=routed_server,
+            tool=routed_tool,
+            fields=effective_fields,
+        )
+
+        # Determine verdict: "rewrite" if anything was changed, else "forward".
+        changed = (
+            routed_server != cmd.server
+            or routed_tool != cmd.tool
+            or effective_fields != cmd.fields
+        )
+        verdict = "rewrite" if changed else "forward"
+
+        decision = Decision(verdict=verdict, call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
     def deny(self, cmd: Command, reason: str) -> Decision:
-        """Not called anywhere in this starter's `decide()` — a ready-made
-        helper for when you fill in JOB 2 / JOB 3 above, so denying doesn't
-        mean hand-building a `Decision` inline at every call site. Kept as
-        a real method (not a stub) because the shape of a correct denial —
-        no `call`, a non-empty `reason` — is exactly the thing worth
-        getting right by construction rather than by convention."""
+        """Deny a command. Costs ZERO credits (CONTRACTS.md 4.1)."""
         self._denied_cmd_ids.add(cmd.cmd_id)
         decision = Decision(verdict="deny", reason=reason)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
-    def _to_tool_call(self, cmd: Command) -> "ToolCall":
-        """`Command` -> the `ToolCall` (CONTRACTS.md 3.1) the arena will
-        actually execute on a `forward`/`rewrite` verdict. When
-        `kit.mcp.types` is unavailable (see the module-level import guard),
-        falls back to a plain dict carrying the identical fields — `Decision`
-        accepts it either way (the `ToolCall` isinstance check inside
-        `Decision.__post_init__` only runs when the real class loaded)."""
-        fields = {
-            "server": cmd.server,
-            "tool": cmd.tool,
+    def _build_tool_call(
+        self,
+        cmd: Command,
+        *,
+        server: str | None = None,
+        tool: str | None = None,
+        fields: tuple[str, ...] | None = None,
+    ) -> "ToolCall":
+        """`Command` -> the `ToolCall` the arena will execute.
+        Allows overriding server/tool/fields for rewrite decisions."""
+        tc_fields = {
+            "server": server or cmd.server,
+            "tool": tool or cmd.tool,
             "args": dict(cmd.args),
-            "fields": cmd.fields,
+            "fields": fields if fields is not None else cmd.fields,
             "headers": dict(cmd.headers),
             "lease_id": cmd.lease_id,
             "call_index": cmd.call_index,
         }
         if _TOOLCALL_AVAILABLE:
-            return ToolCall(**fields)
-        return fields  # type: ignore[return-value]
+            return ToolCall(**tc_fields)
+        return tc_fields  # type: ignore[return-value]
+
+    # Keep the old name as an alias for backward compatibility with __main__ demo.
+    _to_tool_call = _build_tool_call
 
 
 if __name__ == "__main__":

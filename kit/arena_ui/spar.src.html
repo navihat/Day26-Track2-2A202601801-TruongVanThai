@@ -126,7 +126,7 @@ function toLogicalXY(clientX, clientY) {
 
 const params = new URLSearchParams(window.location.search);
 const RUN_ID = params.get('run');
-const EXCHANGE_ID = params.get('exchange');
+const EXCHANGE_ID = params.get('exchange') || (RUN_ID ? 'events' : null);
 const REPLAY_PATH = params.get('replay');
 const YOU = params.get('you') === 'B' ? 'B' : 'A';
 const OPPONENT = YOU === 'A' ? 'B' : 'A';
@@ -521,16 +521,50 @@ function drawIntegrityBanner(t) {
 function drawKoOverlay(state, t) {
   if (!fx.koAt) return;
   ctx.save();
-  drawFlatPanel(0, 0, LOGICAL_W, LOGICAL_H, 'rgba(10,14,22,0.88)', null);
-  if (SPRITES && SPRITES.skull) {
-    const scale = 9;
-    const w = SPRITES.skull.width * scale;
-    const h = SPRITES.skull.height * scale;
-    drawSprite(ctx, SPRITES.skull, LOGICAL_W / 2 - w / 2, LOGICAL_H / 2 - h / 2 - 50, scale);
+  drawFlatPanel(0, 0, LOGICAL_W, LOGICAL_H, 'rgba(10,14,22,0.92)', null);
+
+  const youHp = state.sides[YOU].hp;
+  const oppHp = state.sides[OPPONENT].hp;
+  const youWon = youHp > oppHp;
+  const youLost = youHp < oppHp;
+
+  if (youWon) {
+    const sprite = SPRITES && SPRITES.agentA && SPRITES.agentA.idle ? SPRITES.agentA.idle : null;
+    if (sprite) {
+      const scale = 8;
+      const w = sprite.width * scale;
+      const h = sprite.height * scale;
+      drawSprite(ctx, sprite, LOGICAL_W / 2 - w / 2, LOGICAL_H / 2 - h / 2 - 50, scale);
+    }
+    const winTitle = 'BAN DA THANG!';
+    const winSub = `VICTORY  --  YOU ${youHp} - ${oppHp} ${labelFor(OPPONENT)}`;
+    const tw1 = measurePixelText(ctx, winTitle, 4);
+    drawPixelText(ctx, LOGICAL_W / 2 - tw1 / 2, LOGICAL_H / 2 + 40, winTitle, COLORS.sideA, 4);
+    const tw2 = measurePixelText(ctx, winSub, 2);
+    drawPixelText(ctx, LOGICAL_W / 2 - tw2 / 2, LOGICAL_H / 2 + 85, winSub, COLORS.text, 2);
+  } else if (youLost) {
+    const sprite = SPRITES && SPRITES.agentA && SPRITES.agentA.ko ? SPRITES.agentA.ko : null;
+    if (sprite) {
+      const scale = 8;
+      const w = sprite.width * scale;
+      const h = sprite.height * scale;
+      drawSprite(ctx, sprite, LOGICAL_W / 2 - w / 2, LOGICAL_H / 2 - h / 2 - 50, scale);
+    }
+    const lossTitle = 'BAN DA THUA!';
+    const lossSub = `DEFEAT  --  YOU ${youHp} - ${oppHp} ${labelFor(OPPONENT)}`;
+    const tw1 = measurePixelText(ctx, lossTitle, 4);
+    drawPixelText(ctx, LOGICAL_W / 2 - tw1 / 2, LOGICAL_H / 2 + 40, lossTitle, COLORS.damageRed, 4);
+    const tw2 = measurePixelText(ctx, lossSub, 2);
+    drawPixelText(ctx, LOGICAL_W / 2 - tw2 / 2, LOGICAL_H / 2 + 85, lossSub, COLORS.textDim, 2);
+  } else {
+    const drawTitle = 'HOA NHAU!';
+    const drawSub = `DRAW  --  YOU ${youHp} - ${oppHp} ${labelFor(OPPONENT)}`;
+    const tw1 = measurePixelText(ctx, drawTitle, 4);
+    drawPixelText(ctx, LOGICAL_W / 2 - tw1 / 2, LOGICAL_H / 2 + 40, drawTitle, COLORS.unprovenGrey, 4);
+    const tw2 = measurePixelText(ctx, drawSub, 2);
+    drawPixelText(ctx, LOGICAL_W / 2 - tw2 / 2, LOGICAL_H / 2 + 85, drawSub, COLORS.textDim, 2);
   }
-  const koText = 'K.O.';
-  const tw = measurePixelText(ctx, koText, 4);
-  drawPixelText(ctx, LOGICAL_W / 2 - tw / 2, LOGICAL_H / 2 + 60, koText, COLORS.damageRed, 4);
+
   ctx.restore();
 }
 
